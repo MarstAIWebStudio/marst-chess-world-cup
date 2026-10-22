@@ -1,3 +1,4 @@
+
 import { Chess, type Square } from "chess.js";
 import {
   useCallback,
@@ -13,16 +14,23 @@ import {
   collection,
   doc,
   setDoc,
-  getDocs,
   onSnapshot,
   serverTimestamp,
 } from "./lib/firebase";
-import { gradeMove, type MoveGrade } from "./lib/ratings";
+import { type MoveGrade } from "./lib/ratings";
 
 type Player = {
   id: string;
   nickname: string;
   joinedAt: number;
+};
+
+type GameMove = {
+  san: string;
+  grade: MoveGrade;
+  label: string;
+  fen: string;
+  ply: number;
 };
 
 type Match = {
@@ -32,15 +40,14 @@ type Match = {
   round: number;
   fen: string;
   pgn: string;
-  moves: Array<{
-    san: string;
-    grade: MoveGrade;
-    label: string;
-    fen: string;
-  }>;
+  moves: GameMove[];
+  gameMoves?: GameMove[];
   wins: { white: number; black: number };
   status: "waiting" | "playing" | "finished";
   result: "white" | "black" | "draw" | null;
+  gamesPlayed?: number;
+  drawCount?: number;
+  boardNumber?: number;
 };
 
 type EngineResult = {
@@ -85,7 +92,11 @@ function readLocal<T>(key: string, fallback: T): T {
 }
 
 function saveLocal<T>(key: string, value: T) {
-  localStorage.setItem(key, JSON.stringify(value));
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // 브라우저 저장 공간이 없더라도 현재 화면은 계속 동작한다.
+  }
 }
 
 function shuffle<T>(items: T[]): T[] {
@@ -110,6 +121,7 @@ function createMatches(players: Player[]): Match[] {
   for (let i = 0; i < shuffled.length; i += 2) {
     const white = shuffled[i];
     const black = shuffled[i + 1] ?? null;
+    const hasBye = black === null;
 
     matches.push({
       id: makeId(),
@@ -119,16 +131,31 @@ function createMatches(players: Player[]): Match[] {
       fen: INITIAL_FEN,
       pgn: "",
       moves: [],
-      wins: {
-        white: black ? 0 : 2,
-        black: 0,
-      },
-      status: black ? "waiting" : "finished",
-      result: black ? null : "white",
+      gameMoves: [],
+      wins: { white: hasBye ? 2 : 0, black: 0 },
+      status: hasBye ? "finished" : "waiting",
+      result: hasBye ? "white" : null,
+      gamesPlayed: 0,
+      drawCount: 0,
+      boardNumber: 1,
     });
   }
 
   return matches;
+}
+
+function normalizeMatch(match: Match): Match {
+  return {
+    ...match,
+    moves: Array.isArray(match.moves) ? match.moves : [],
+    gameMoves: Array.isArray(match.gameMoves)
+      ? match.gameMoves
+      : [],
+    wins: match.wins ?? { white: 0, black: 0 },
+    gamesPlayed: match.gamesPlayed ?? 0,
+    drawCount: match.drawCount ?? 0,
+    boardNumber: match.boardNumber ?? 1,
+  };
 }
 
 function Board({
@@ -145,6 +172,7 @@ function Board({
   disabled: boolean;
 }) {
   const board = game.board();
+
   const legalTargets = useMemo(() => {
     if (!selected) return [];
 
@@ -162,9 +190,7 @@ function Board({
     <div className="chessboard">
       {board.flatMap((row, rowIndex) =>
         row.map((piece, colIndex) => {
-          const square =
-            `${"abcdefgh"[colIndex]}${8 - rowIndex}`;
-
+          const square = `${"abcdefgh"[colIndex]}${8 - rowIndex}`;
           const light = (rowIndex + colIndex) % 2 === 0;
           const isSelected = selected === square;
           const isTarget = legalTargets.includes(square);
@@ -190,23 +216,15 @@ function Board({
                   return;
                 }
 
-                if (piece) {
-                  const color = piece.color;
-                  const currentTurn = game.turn();
-
-                  if (color === currentTurn) {
-                    setSelected(square);
-                    return;
-                  }
+                if (piece && piece.color === game.turn()) {
+                  setSelected(square);
+                } else {
+                  setSelected(null);
                 }
-
-                setSelected(null);
               }}
             >
               {colIndex === 0 && (
-                <span className="rank-label">
-                  {8 - rowIndex}
-                </span>
+                <span className="rank-label">{8 - rowIndex}</span>
               )}
 
               {rowIndex === 7 && (
@@ -226,9 +244,7 @@ function Board({
                 </span>
               )}
 
-              {!piece && isTarget && (
-                <span className="move-dot" />
-              )}
+              {!piece && isTarget && <span className="move-dot" />}
             </button>
           );
         })
@@ -271,18 +287,27 @@ function StockfishPanel({
     workerRef.current = worker;
     setStatus("Stockfish 초기화 중");
 
+    let ready = false;
+    let searchStarted = false;
+    let latestScore = 0;
+    let latestDepth = 0;
+
     worker.onmessage = (event: MessageEvent<string>) => {
       const line = String(event.data);
 
       if (line === "uciok") {
         worker.postMessage("isready");
+        return;
       }
 
-      if (line === "readyok") {
+      if (line === "readyok" && !ready) {
+        ready = true;
         setStatus("실시간 분석 중");
         worker.postMessage("ucinewgame");
         worker.postMessage(`position fen ${fen}`);
         worker.postMessage("go depth 12");
+        searchStarted = true;
+        return;
       }
 
       if (line.startsWith("info ")) {
@@ -291,21 +316,23 @@ function StockfishPanel({
           /\bscore\s+(cp|mate)\s+(-?\d+)/
         );
 
+        if (depthMatch) latestDepth = Number(depthMatch[1]);
+
         if (scoreMatch) {
-          const depth = Number(depthMatch?.[1] ?? 0);
           const value = Number(scoreMatch[2]);
           const turn = fen.split(" ")[1];
 
-          let score = scoreMatch[1] === "mate"
-            ? Math.sign(value) * 1000
-            : value / 100;
+          latestScore =
+            scoreMatch[1] === "mate"
+              ? Math.sign(value) * 1000
+              : value / 100;
 
-          if (turn === "b") score *= -1;
+          if (turn === "b") latestScore *= -1;
 
           setEngine((previous) => ({
-            score,
+            score: latestScore,
             bestMove: previous?.bestMove ?? "",
-            depth,
+            depth: latestDepth,
           }));
         }
       }
@@ -313,11 +340,13 @@ function StockfishPanel({
       if (line.startsWith("bestmove ")) {
         const bestMove = line.split(/\s+/)[1];
 
-        setEngine((previous) => ({
-          score: previous?.score ?? 0,
+        setEngine({
+          score: latestScore,
           bestMove: bestMove === "(none)" ? "" : bestMove,
-          depth: previous?.depth ?? 0,
-        }));
+          depth: latestDepth,
+        });
+
+        if (searchStarted) setStatus("분석 완료");
       }
     };
 
@@ -329,6 +358,7 @@ function StockfishPanel({
 
     return () => {
       worker.terminate();
+
       if (workerRef.current === worker) {
         workerRef.current = null;
       }
@@ -359,7 +389,6 @@ function StockfishPanel({
               : engine.score.toFixed(2)
             : "—"}
         </span>
-
         <span className="engine-status">{status}</span>
       </div>
 
@@ -389,6 +418,7 @@ function StockfishPanel({
 
       <p className="muted small">
         엔진 평가는 분석 진행 중 변경될 수 있어.
+        추천 수는 현재 분석 결과이며, 기보의 수 평가와는 별도야.
       </p>
     </section>
   );
@@ -398,27 +428,26 @@ export default function App() {
   const [nickname, setNickname] = useState(
     () => localStorage.getItem(STORAGE.nickname) ?? ""
   );
-
   const [draft, setDraft] = useState("");
   const [applications, setApplications] = useState<Player[]>(
     () => readLocal(STORAGE.applications, [])
   );
-
   const [matches, setMatches] = useState<Match[]>(
-    () => readLocal(STORAGE.matches, [])
+    () => readLocal<Match[]>(STORAGE.matches, []).map(normalizeMatch)
   );
-
   const [activeMatchId, setActiveMatchId] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [page, setPage] = useState("home");
   const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(false);
-
   const [roundLabel, setRoundLabel] = useState("참가 신청 진행 중");
 
-  const activeMatch = matches.find(
+  const activeMatchRaw = matches.find(
     (match) => match.id === activeMatchId
   );
+  const activeMatch = activeMatchRaw
+    ? normalizeMatch(activeMatchRaw)
+    : undefined;
 
   const game = useMemo(() => {
     const chess = new Chess();
@@ -434,10 +463,6 @@ export default function App() {
     return chess;
   }, [activeMatch?.fen]);
 
-  const currentPlayer = applications.find(
-    (player) => player.nickname.toLowerCase() === nickname.toLowerCase()
-  );
-
   useEffect(() => {
     saveLocal(STORAGE.applications, applications);
   }, [applications]);
@@ -452,12 +477,12 @@ export default function App() {
     const stopApplications = onSnapshot(
       collection(db, "applications"),
       (snapshot) => {
-        const next = snapshot.docs.map((item) => ({
-          id: item.id,
-          ...(item.data() as Omit<Player, "id">),
-        }));
-
-        setApplications(next);
+        setApplications(
+          snapshot.docs.map((item) => ({
+            id: item.id,
+            ...(item.data() as Omit<Player, "id">),
+          }))
+        );
       },
       () => setNotice("신청 데이터 동기화에 실패했어.")
     );
@@ -465,12 +490,14 @@ export default function App() {
     const stopMatches = onSnapshot(
       collection(db, "matches"),
       (snapshot) => {
-        const next = snapshot.docs.map((item) => ({
-          id: item.id,
-          ...(item.data() as Omit<Match, "id">),
-        }));
-
-        setMatches(next);
+        setMatches(
+          snapshot.docs.map((item) =>
+            normalizeMatch({
+              id: item.id,
+              ...(item.data() as Omit<Match, "id">),
+            })
+          )
+        );
       },
       () => setNotice("대국 데이터 동기화에 실패했어.")
     );
@@ -492,14 +519,12 @@ export default function App() {
     setLoading(true);
 
     try {
-      if (db) {
-        await guestLogin();
-      }
+      if (db) await guestLogin();
 
       const exists = applications.some(
         (player) =>
           player.nickname.toLowerCase() === value.toLowerCase() &&
-          player.nickname !== nickname
+          player.nickname.toLowerCase() !== nickname.toLowerCase()
       );
 
       if (exists) {
@@ -591,38 +616,24 @@ export default function App() {
   const playMove = useCallback(
     async (from: string, to: string) => {
       if (!activeMatch || activeMatch.status === "finished") return;
-
       if (!activeMatch.black) return;
 
       const isWhiteTurn = game.turn() === "w";
-      const myNickname = nickname;
 
       if (
-        (isWhiteTurn && activeMatch.white.nickname !== myNickname) ||
-        (!isWhiteTurn && activeMatch.black.nickname !== myNickname)
+        (isWhiteTurn && activeMatch.white.nickname !== nickname) ||
+        (!isWhiteTurn && activeMatch.black.nickname !== nickname)
       ) {
         setNotice("네 차례가 아니거나 이 경기의 선수가 아니야.");
         return;
       }
 
-      const beforeGame = new Chess(activeMatch.fen);
-      const beforeMaterial = Object.values(
-        beforeGame.board().flat().reduce<Record<string, number>>(
-          (acc, piece) => {
-            if (piece) {
-              const key = piece.color + piece.type;
-              acc[key] = (acc[key] ?? 0) + 1;
-            }
-            return acc;
-          },
-          {}
-        )
-      ).reduce((sum, value) => sum + value, 0);
-
       const nextGame = new Chess(activeMatch.fen);
 
+      let played;
+
       try {
-        nextGame.move({
+        played = nextGame.move({
           from: from as Square,
           to: to as Square,
           promotion: "q",
@@ -632,69 +643,89 @@ export default function App() {
         return;
       }
 
-      const afterMaterial = Object.values(
-        nextGame.board().flat().reduce<Record<string, number>>(
-          (acc, piece) => {
-            if (piece) {
-              const key = piece.color + piece.type;
-              acc[key] = (acc[key] ?? 0) + 1;
-            }
-            return acc;
-          },
-          {}
-        )
-      ).reduce((sum, value) => sum + value, 0);
+      if (!played) {
+        setNotice("불가능한 수야.");
+        return;
+      }
 
-      const san = nextGame.history().at(-1) ?? "";
-      const lastMove = nextGame.history({ verbose: true }).at(-1);
+      const san = played.san;
+      const boardMoves = activeMatch.gameMoves ?? [];
+      const grade: MoveGrade = "-";
 
-      // 실제 엔진의 직전 최선 수와 비교하는 기능은
-      // 아래 StockfishPanel의 엔진 결과와 통합할 때 사용한다.
-      // 엔진 결과가 없을 때는 최선수나 실수라고 허위 판정하지 않는다.
-      const grade: MoveGrade =
-        beforeMaterial !== afterMaterial ? "?!" : "-";
-
-      const move = {
+      const move: GameMove = {
         san,
         grade,
         label: GRADES[grade],
         fen: nextGame.fen(),
+        ply: boardMoves.length + 1,
       };
 
-      const isDraw = nextGame.isDraw();
       const isMate = nextGame.isCheckmate();
-      const isFinished = isDraw || isMate;
+      const isDraw = nextGame.isDraw();
+      const boardFinished = isMate || isDraw;
 
-      let wins = { ...activeMatch.wins };
+      const wins = { ...activeMatch.wins };
       let result = activeMatch.result;
-      let status: Match["status"] = isFinished ? "finished" : "playing";
+      let status: Match["status"] = "playing";
+      let nextFen = nextGame.fen();
+      let nextPgn = nextGame.pgn();
+      let nextBoardMoves = [...boardMoves, move];
+      let nextGamesPlayed = activeMatch.gamesPlayed ?? 0;
+      let nextDrawCount = activeMatch.drawCount ?? 0;
+      let nextMoves = [...activeMatch.moves, move];
+      let noticeText = "已 저장!"; // 아래에서 자연스러운 메시지로 교체
 
-      if (isMate) {
-        if (nextGame.turn() === "w") wins.black += 1;
-        else wins.white += 1;
+      if (boardFinished) {
+        nextGamesPlayed += 1;
+
+        if (isMate) {
+          if (nextGame.turn() === "w") wins.black += 1;
+          else wins.white += 1;
+        } else {
+          nextDrawCount += 1;
+        }
+
+        if (wins.white >= 2) result = "white";
+        else if (wins.black >= 2) result = "black";
+
+        if (result) {
+          status = "finished";
+          noticeText = `경기 종료! ${
+            result === "white"
+              ? activeMatch.white.nickname
+              : activeMatch.black.nickname
+          } 승리`;
+        } else {
+          // 다음 판은 초기 체스판에서 시작하지만, 전체 경기 기보는 보존한다.
+          nextFen = INITIAL_FEN;
+          nextPgn = "";
+          nextBoardMoves = [];
+          status = "playing";
+          noticeText = isDraw
+            ? "무승부! 점수는 그대로야. 다음 판을 시작해."
+            : "한 판 종료! 다음 판을 시작해.";
+        }
+      } else {
+        noticeText = "수 저장 완료!";
       }
-
-      if (wins.white >= 2) result = "white";
-      else if (wins.black >= 2) result = "black";
-
-      if (result || isDraw) status = "finished";
 
       const updated: Match = {
         ...activeMatch,
-        fen: nextGame.fen(),
-        pgn: nextGame.pgn(),
-        moves: [...activeMatch.moves, move],
+        fen: nextFen,
+        pgn: nextPgn,
+        moves: nextMoves,
+        gameMoves: nextBoardMoves,
         wins,
         result,
         status,
+        gamesPlayed: nextGamesPlayed,
+        drawCount: nextDrawCount,
+        boardNumber: nextGamesPlayed + 1,
       };
 
       try {
         if (db) {
-          await setDoc(
-            doc(db, "matches", updated.id),
-            updated
-          );
+          await setDoc(doc(db, "matches", updated.id), updated);
         }
 
         setMatches((previous) =>
@@ -703,19 +734,9 @@ export default function App() {
           )
         );
 
-        if (isFinished && !result) {
-          setNotice("무승부! 대회 규정에 따라 결과 처리가 필요해.");
-        } else if (result) {
-          setNotice(
-            `경기 종료! ${
-              result === "white"
-                ? updated.white.nickname
-                : updated.black?.nickname
-            } 승리`
-          );
-        }
+        setNotice(noticeText);
       } catch {
-        setNotice("수 저장에 실패했어. 다시 연결해 줘.");
+        setNotice("수 저장에 실패했어. 연결 상태를 확인해 줘.");
       }
 
       setSelected(null);
@@ -728,6 +749,8 @@ export default function App() {
     setPage("match");
     setSelected(null);
   };
+
+  const activeBoardMoves = activeMatch?.gameMoves ?? [];
 
   return (
     <div className="app-shell">
@@ -748,7 +771,10 @@ export default function App() {
 
         <button
           className="profile-button"
-          onClick={() => setPage("login")}
+          onClick={() => {
+            setDraft(nickname);
+            setPage("login");
+          }}
         >
           {nickname || "닉네임 로그인"}
         </button>
@@ -766,16 +792,12 @@ export default function App() {
           <>
             <section className="hero">
               <div className="hero-copy">
-                <div className="eyebrow">
-                  THE NEXT MOVE IS YOURS
-                </div>
-
+                <div className="eyebrow">THE NEXT MOVE IS YOURS</div>
                 <h1>
                   당신의 한 수가
                   <br />
                   <span>월드 챔피언을 결정한다.</span>
                 </h1>
-
                 <p>
                   참가 신청부터 랜덤 대진표, 실시간 대국과
                   엔진 분석까지. 모든 승부가 이곳에서 시작돼.
@@ -791,7 +813,6 @@ export default function App() {
                   >
                     월드컵 신청하기 ↗
                   </button>
-
                   <button
                     className="secondary-button"
                     onClick={() => setPage("bracket")}
@@ -810,14 +831,8 @@ export default function App() {
             </section>
 
             <section className="stats-grid">
-              <Stat
-                number={applications.length.toString()}
-                label="참가 신청"
-              />
-              <Stat
-                number={matches.length.toString()}
-                label="등록된 경기"
-              />
+              <Stat number={applications.length.toString()} label="참가 신청" />
+              <Stat number={matches.length.toString()} label="등록된 경기" />
               <Stat
                 number={matches
                   .filter((match) => match.status === "finished")
@@ -833,9 +848,7 @@ export default function App() {
                   <span className="eyebrow">TOURNAMENT</span>
                   <h2>대회 안내</h2>
                 </div>
-                <span className="status-pill">
-                  {roundLabel}
-                </span>
+                <span className="status-pill">{roundLabel}</span>
               </div>
 
               <div className="feature-grid">
@@ -868,24 +881,17 @@ export default function App() {
                   <span className="eyebrow">LIVE MATCHES</span>
                   <h2>진행 중인 경기</h2>
                 </div>
-                <button
-                  className="text-button"
-                  onClick={() => setPage("watch")}
-                >
+                <button className="text-button" onClick={() => setPage("watch")}>
                   전체 관전 →
                 </button>
               </div>
 
               <div className="match-list">
-                {matches.filter(
-                  (match) => match.status !== "finished"
-                ).length === 0 ? (
+                {matches.filter((match) => match.status !== "finished").length === 0 ? (
                   <div className="empty-state">
                     <span>♟</span>
                     <h3>아직 등록된 경기가 없어</h3>
-                    <p>
-                      참가자를 모집하고 대진표를 생성해 줘.
-                    </p>
+                    <p>참가자를 모집하고 대진표를 생성해 줘.</p>
                   </div>
                 ) : (
                   matches
@@ -893,7 +899,7 @@ export default function App() {
                     .map((match) => (
                       <MatchCard
                         key={match.id}
-                        match={match}
+                        match={normalizeMatch(match)}
                         onClick={() => openMatch(match)}
                       />
                     ))
@@ -925,18 +931,13 @@ export default function App() {
                 maxLength={16}
                 required
               />
-              <button
-                className="primary-button"
-                type="submit"
-                disabled={loading}
-              >
+              <button className="primary-button" type="submit" disabled={loading}>
                 {loading ? "입장 중..." : "닉네임으로 입장"}
               </button>
             </form>
 
             <p className="muted small">
-              현재 닉네임은 이 브라우저에 저장돼.
-              Firebase를 설정하면 익명 계정도 사용할 수 있어.
+              닉네임은 이 브라우저에 저장돼. Firebase를 설정하면 익명 인증을 사용할 수 있어.
             </p>
           </section>
         )}
@@ -949,25 +950,20 @@ export default function App() {
                 <h1>월드컵 대진표</h1>
                 <p>3판 2선승제 · 랜덤 매칭</p>
               </div>
-
-              <button
-                className="primary-button"
-                onClick={() => void generateBracket()}
-              >
+              <button className="primary-button" onClick={() => void generateBracket()}>
                 랜덤 대진표 생성
               </button>
             </div>
 
             <div className="admin-warning">
-              대진표 생성 버튼은 현재 개발용이야.
-              공개 운영에서는 운영자 권한 검증이 필요해.
+              개발용 대진표 생성 기능이야. 공개 운영에서는 운영자 권한 검증과 서버 측 경기 검증이 필요해.
             </div>
 
             <div className="bracket-grid">
               {matches.map((match) => (
                 <MatchCard
                   key={match.id}
-                  match={match}
+                  match={normalizeMatch(match)}
                   onClick={() => openMatch(match)}
                 />
               ))}
@@ -983,9 +979,7 @@ export default function App() {
             <div className="player-list">
               {applications.map((player, index) => (
                 <div className="player-row" key={player.id}>
-                  <span className="player-number">
-                    {String(index + 1).padStart(2, "0")}
-                  </span>
+                  <span className="player-number">{String(index + 1).padStart(2, "0")}</span>
                   <span>{player.nickname}</span>
                   <span className="player-status">신청 완료</span>
                 </div>
@@ -997,10 +991,7 @@ export default function App() {
         {page === "match" && activeMatch && (
           <section className="game-page">
             <div className="game-topbar">
-              <button
-                className="text-button"
-                onClick={() => setPage("bracket")}
-              >
+              <button className="text-button" onClick={() => setPage("bracket")}>
                 ← 대진표
               </button>
               <span className="live-pill">
@@ -1020,9 +1011,7 @@ export default function App() {
                     <strong>{activeMatch.black?.nickname ?? "부전승"}</strong>
                     <span>흑 · Black</span>
                   </div>
-                  <strong className="game-score">
-                    {activeMatch.wins.black}
-                  </strong>
+                  <strong className="game-score">{activeMatch.wins.black}</strong>
                 </div>
 
                 <Board
@@ -1032,6 +1021,7 @@ export default function App() {
                   onMove={(from, to) => void playMove(from, to)}
                   disabled={
                     activeMatch.status === "finished" ||
+                    activeMatch.status === "waiting" ||
                     !activeMatch.black
                   }
                 />
@@ -1042,9 +1032,7 @@ export default function App() {
                     <strong>{activeMatch.white.nickname}</strong>
                     <span>백 · White</span>
                   </div>
-                  <strong className="game-score">
-                    {activeMatch.wins.white}
-                  </strong>
+                  <strong className="game-score">{activeMatch.wins.white}</strong>
                 </div>
 
                 <div className="game-actions">
@@ -1058,52 +1046,66 @@ export default function App() {
                           : "흑 차례"}
                   </span>
                   <span className="muted small">
-                    무르기 비활성화
+                    판 {activeMatch.boardNumber ?? 1} · 무르기 비활성화
                   </span>
                 </div>
+
+                {activeMatch.status === "waiting" && (
+                  <div className="admin-warning">
+                    아직 시작되지 않은 경기야.
+                  </div>
+                )}
+
+                {activeMatch.status === "finished" && (
+                  <div className="admin-warning">
+                    경기 결과: {activeMatch.result === "draw"
+                      ? "무승부"
+                      : activeMatch.result === "white"
+                        ? `${activeMatch.white.nickname} 승리`
+                        : `${activeMatch.black?.nickname ?? "흑"} 승리`}
+                    {" · "}최종 점수 {activeMatch.wins.white} : {activeMatch.wins.black}
+                  </div>
+                )}
               </section>
 
               <aside className="game-sidebar">
                 <StockfishPanel
                   fen={activeMatch.fen}
-                  lastGrade={
-                    activeMatch.moves.at(-1)?.grade ?? null
-                  }
+                  lastGrade={activeMatch.moves.at(-1)?.grade ?? null}
                 />
 
                 <section className="panel">
                   <div className="panel-heading">
-                    <h3>경기 기보</h3>
-                    <span className="muted small">
-                      {activeMatch.moves.length}수
-                    </span>
+                    <h3>本판 기보</h3>
+                    <span className="muted small">{activeBoardMoves.length}수</span>
                   </div>
 
                   <div className="move-history">
-                    {activeMatch.moves.length === 0 ? (
-                      <p className="muted">
-                        첫 수를 기다리는 중...
-                      </p>
+                    {activeBoardMoves.length === 0 ? (
+                      <p className="muted">첫 수를 기다리는 중...</p>
                     ) : (
-                      activeMatch.moves.map((move, index) => (
+                      activeBoardMoves.map((move, index) => (
                         <div className="move-row" key={`${index}-${move.fen}`}>
-                          <span>{index + 1}.</span>
+                          <span>{Math.ceil((index + 1) / 2)}.</span>
                           <strong>{move.san}</strong>
-                          <span
-                            className={`grade grade-${move.grade.replace(
-                              /[^a-zA-Z0-9]/g,
-                              ""
-                            )}`}
-                          >
-                            {move.grade}
-                          </span>
-                          <span className="muted small">
-                            {move.label}
-                          </span>
+                          <span className="grade">{move.grade}</span>
+                          <span className="muted small">{move.label}</span>
                         </div>
                       ))
                     )}
                   </div>
+                </section>
+
+                <section className="panel">
+                  <div className="panel-heading">
+                    <h3>경기 기록</h3>
+                    <span className="muted small">{activeMatch.moves.length}수</span>
+                  </div>
+                  <p className="muted small">
+                    전체 경기 기보는 보존돼. 현재 판이 끝나면 새 판 기보가 별도로 시작돼.
+                  </p>
+                  <p>무승부: {activeMatch.drawCount ?? 0}회</p>
+                  <p>종료된 판: {activeMatch.gamesPlayed ?? 0}판</p>
                 </section>
               </aside>
             </div>
@@ -1114,9 +1116,7 @@ export default function App() {
           <section className="section-block page-section">
             <span className="eyebrow">SPECTATOR ARENA</span>
             <h1>실시간 관전</h1>
-            <p className="muted">
-              경기를 선택하면 체스판과 분석 패널을 볼 수 있어.
-            </p>
+            <p className="muted">경기를 선택하면 체스판과 분석 패널을 볼 수 있어.</p>
 
             <div className="match-list">
               {matches.length === 0 ? (
@@ -1129,7 +1129,7 @@ export default function App() {
                 matches.map((match) => (
                   <MatchCard
                     key={match.id}
-                    match={match}
+                    match={normalizeMatch(match)}
                     onClick={() => openMatch(match)}
                   />
                 ))
@@ -1152,13 +1152,7 @@ export default function App() {
   );
 }
 
-function Stat({
-  number,
-  label,
-}: {
-  number: string;
-  label: string;
-}) {
+function Stat({ number, label }: { number: string; label: string }) {
   return (
     <div className="stat-card">
       <strong>{number}</strong>
