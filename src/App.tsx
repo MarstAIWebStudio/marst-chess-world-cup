@@ -1219,4 +1219,4 @@ function MatchCard({
       </div>
     </button>
   );
-  }
+}
